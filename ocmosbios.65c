@@ -1,0 +1,1785 @@
+.DEFINE CABE_SHIM_SIZE 67
+.MEMORYMAP
+DEFAULTSLOT 0
+SLOT 0 $F000 $1000-CABE_SHIM_SIZE
+.ENDME
+.ROMBANKSIZE $1000-CABE_SHIM_SIZE
+.ROMBANKS 1
+
+.EMPTYFILL $FF
+
+.DEFINE r_MMUFlags $00
+; used by all types of bootloading
+.DEFINE g_boot_getb $01
+.DEFINE g_boot_ok $04
+.DEFINE g_boot_cursor $14
+; used only during text-based bootloading process
+.DEFINE g_textboot_checksum $03
+; used only during user-driven bootload
+.DEFINE g_userboot_remPasteBytes $05
+; used when booting a filesystem
+.DEFINE g_fsboot_remReadBytes $05
+.DEFINE g_fsboot_targetfile $10
+.DEFINE g_fsboot_targetfilelen $12
+.DEFINE g_fsboot_filehandle $13
+; used when booting a drive
+.DEFINE g_driveboot_flags $05
+.DEFINE g_driveboot_load_length $10
+.DEFINE g_driveboot_load_start $17
+; used at all times
+.DEFINE g_CurKeyInPos $05
+.DEFINE g_CurKeyOutPos $06
+.DEFINE g_UserNMI $07
+.DEFINE g_UserIRQ $09
+.DEFINE g_TermInfo $0B
+.DEFINE g_BIOSFlags $0F
+.DEFINE g_KeyboardBuffer $10
+.DEFINE k_KeyboardBufferLength 11
+.DEFINE g_Temp $1B
+.DEFINE g_EntryPoint $1C
+.DEFINE g_PokeAddr $1E
+.DEFINE g_BootUUID $20
+.DEFINE r_MemBanksLow $200
+.DEFINE r_MemBanksHigh $210
+.DEFINE r_SignalIn $240
+.DEFINE r_ComponentPort $242
+.DEFINE r_DisposeValue $243
+.DEFINE r_ComponentList $246
+.DEFINE r_DriveAddr $260
+.DEFINE r_DriveSectorPages $262
+.DEFINE r_DrivePort $263
+.DEFINE r_DriveNumSectors $264
+.DEFINE r_DriveSector $266
+.DEFINE r_TerminalPort $2FF
+.DEFINE r_Time $248
+
+.ORGA $FFFA-CABE_SHIM_SIZE
+.SECTION "!InterruptHandlers" FORCE
+.DW int_NMI, int_RESET, int_IRQ
+.ENDS
+
+.MACRO TermOut
+        PHA
+        PHX
+        LDX #0
+_TermOutLoop\@:
+        LDA.W _TermOutString\@, X
+        STA r_TerminalPort
+        INX
+        CPX #_TermOutStringEnd\@-_TermOutString\@
+        BNE _TermOutLoop\@
+        PLX
+        PLA
+        BRA _TermOutStringEnd\@
+_TermOutString\@:
+.REPEAT NARGS
+.DB \1
+.SHIFT
+.ENDR
+_TermOutStringEnd\@:
+.ENDM
+
+.MACRO TermOutC3
+; Like TermOut, but clobbers A and outputs exactly three bytes.
+; (Using this saves 49 bytes.)
+        LDA #\1
+        STA r_TerminalPort
+        LDA #\2
+        STA r_TerminalPort
+        LDA #\3
+        STA r_TerminalPort
+.ENDM
+
+.ORG 0
+.SECTION "TinyOCMOS" FORCE
+
+.DW getb, echo, discard
+
+getb:
+        ; (do not save A, clobbering it is in our contract)
+        ; Save X
+        PHX
+        ; We don't want a signal to get processed in the middle of us trying
+        ; to read from the keyboard buffer
+--      SEI
+        ; InPos == OutPos means that there is not a key ready
+        LDX g_CurKeyOutPos
+        CPX g_CurKeyInPos
+        BEQ _awaitChar
+        ; There is a key ready. Clear overflow bit and grab it.
+        CLV
+        LDA g_KeyboardBuffer,X
+        INX
+        CPX #k_KeyboardBufferLength
+        BNE +
+        LDX #0
++       STX g_CurKeyOutPos
+-       CLI
+        ; Restore X and return
+        PLX
+        RTS
+_noChar:
+        ; set overflow bit
+        LDA #$7F
+        ADC #$7F
+        BRA -
+_awaitChar:
+         ; If the user wants non-blocking getb, give it to 'em
+        BBS3 g_BIOSFlags,_noChar
+        ; Displaying the blinking cursor.
+        ; Is this an "on" timeslice or an "off" timeslice?
+        LDA r_Time+6
+        LDX #$FF ; prepare to output $FF
+        BIT #16
+        BEQ +
+        DEX ; wait! make that $FE
++       STX r_TerminalPort
+        ; And this subtracts the low 4 bits from 16. Trust me, it does.
+        AND #15
+        EOR #$FF
+        SEC
+        ADC #16
+        ; Thus, letting us sleep until the next timeslice.
+        STA r_Time+6
+        ; CLI after the sleep and not before, because otherwise we would sleep
+        ; if a signal happened to arrive between the original "key available"
+        ; check and the subsequent sleep.
+        CLI
+        ; if an interrupt came, we'll process it here
+        BRA --
+
+echo:
+        ; Echo the character in a human-readable way
+        CMP #$7F
+        BEQ _del ; delete demands special handling
+        BCS _printable ; non-ASCII character, "probably" printable
+        CMP #7
+        BEQ _bel ; BEL demands special handling
+        CMP #$20
+        BCS _printable ; printable ASCII character, ... so, printable
+        BRA _control ; control character
+_bel:
+        STA r_TerminalPort ; in addition to outputting ^G, beep the bell
+_control:
+        PHX
+        TAX
+        LDA #'^'
+        STA r_TerminalPort
+        TXA
+        ORA #$40
+        STA r_TerminalPort
+        TXA
+        PLX
+        RTS
+_del:   TermOut "^`" ; ⌦ isn't in OC's font...
+        RTS
+_printable:
+        STA r_TerminalPort
+        RTS
+
+discard:
+        ; we don't want a signal while we're clearing the buffer
+        SEI
+        STZ g_CurKeyInPos
+        STZ g_CurKeyOutPos
+        CLI
+        RTS
+
+int_NMI:
+        ; Is the user doing their own NMI handling?
+        BBS2 g_BIOSFlags,+
+        ; No. Print a message and enter the monitor.
+        TermOut 13, ">>> NMI", 13
+        ; Before we enter, record whether we will need to return to User mode
+        BBS7 r_MMUFlags,++
+        RMB1 g_Temp
+        JMP int_EnterMonitor
+++      SMB1 g_Temp
+        JMP int_EnterMonitor
+        ; Yes. Re-enter user mode (if needed) and jump to their NMI handler.
++       BBS7 r_MMUFlags,++
+        SMB1 r_MMUFlags
+++      JMP (g_UserNMI)
+
+int_IRQ:
+        ; Was this a BRK or an IRQ?
+        PHX
+        TSX
+        PHA
+        INX
+        INX
+        LDA #$10
+        BIT $0100,X
+        ; EQ=IRQ, NE=BRK
+        BEQ +++
+        ; It was a BRK.
+        PLA
+        PLX
+        ; Is the user doing their own BRK handling?
+        BBS1 g_BIOSFlags,+
+        ; No. Print a message and enter the monitor.
+        TermOut 13, ">>> BRK", 13
+        ; Before we enter, record whether we will need to return to User mode
+        BBS6 r_MMUFlags,++
+        RMB1 g_Temp
+        JMP int_EnterMonitor
+++      SMB1 g_Temp
+        JMP int_EnterMonitor
+-
++       ; Yes. Re-enter user mode (if needed) and jump to their IRQ handler.
+        BBS6 r_MMUFlags,++
+        SMB1 r_MMUFlags
+++      JMP (g_UserIRQ)
++++     ; It was an IRQ.
+        PLA
+        PLX
+        ; Is the user doing their own IRQ handling?
+        BBS0 g_BIOSFlags,-
+        ; No. Handle the signal.
+int_HandleSignal:
+        PHA
+        PHX
+        PHY
+_signalProcessingLoop:
+        CLV
+        LDA r_SignalIn
+        BVS _doneProcessingSignals ; no signal to process
+        BNE _discardSignal ; very long string, or other weird signal
+        LDA r_SignalIn
+        TAY ; save the length of the signal name in Y
+        TAX
+        JSR _perfectHashSignalIn
+        CMP #29 ; key_down?
+        BEQ int_maybeKeyDown
+        CMP #87 ; terminal_size?
+        BEQ int_maybeTerminalSize
+        BBS4 g_BIOSFlags,+ ; ignore component_added/removed if BIOS flag 4 set
+        CMP #104 ; component_added?
+        BEQ int_maybeComponentAdded
+        CMP #85 ; component_removed?
+        BEQ int_maybeComponentRemoved
++
+_discardSignal:
+        STZ r_SignalIn
+        ; Try processing another signal.
+        BRA _signalProcessingLoop
+_doneProcessingSignals:
+        PLY
+        PLX
+        PLA
+_RTI:
+        ; Re-enter user mode (if needed) and return.
+        BBS6 r_MMUFlags,+
+        SMB1 r_MMUFlags
++       RTI
+
+int_maybeComponentAdded:
+        CPY #15
+        BNE _discardSignal
+        BRA +
+int_maybeComponentRemoved
+        CPY #17
+        BNE _discardSignal
++       ; Skip the UUID of the added component
+        JSR _skipUUID
+        LDA r_SignalIn
+        BNE _discardSignal ; non-zero = long string or not a string
+        LDA r_SignalIn
+        TAX
+        TAY
+        JSR _perfectHashSignalIn
+        CMP #241
+        BEQ _maybeGPU
+        CMP #236
+        BEQ _maybeScreen
+        BRA _discardSignal
+
+_maybeGPU:
+        CPY #3
+        BNE _discardSignal
+        BRA +
+_maybeScreen:
+        CPY #6
+        BNE _discardSignal
+        ; simulate control-L
+        LDA #12
+        JSR free_pushKey
+        BRA _discardSignal
+
+int_maybeTerminalSize:
+        CPY #13
+        BNE _discardSignal
+        LDA r_SignalIn
+        BMI _discardSignal
+        CMP #$40
+        BCC _discardSignal
+        ; high byte in range $40-$7F: UIFTAG_BYTE_ARRAY
+        BNE + ; if high byte non-zero, no need to check low byte
+        LDA r_SignalIn
+        CMP #$04
+        BCC _discardSignal ; less than 4 bytes
+        BRA ++
++       LDA r_SignalIn ; skip past the low byte
+++      LDX #0
+-       LDA r_SignalIn
+        STA g_TermInfo,X
+        INX
+        CPX #4
+        BNE -
+_discardSignal2: ; long signal handler is long
+        BRA _discardSignal ; did what we came for
+
+int_maybeKeyDown:
+        CPY #8 ; `key_down` is 8 chars long
+        BNE _discardSignal
+        ; Skip the UUID of the keyboard
+        JSR _skipUUID
+        ; Integer: the character code
+        LDA r_SignalIn
+        CMP #$FF
+        BNE _discardSignal ; definitely not an integer
+        LDA r_SignalIn
+        CMP #$FB
+        BNE _discardSignal2 ; not an integer
+        LDA r_SignalIn
+        BNE _discardSignal2 ; definitely not in the U+0000 to U+10FFFF range
+        LDA r_SignalIn
+        BNE _fourByteChar ; U+10000 to U+10FFFF
+        LDA r_SignalIn
+        BEQ _oneOrTwoByteChar
+        CMP #$08
+        BCS _threeByteChar ; U+0800 to U+FFFF
+_twoByteChar:
+        ASL
+        ASL
+        ORA #$C0
+        BRA _oneInputByteLeft ; hijack the end of _fourByteChar
+_threeByteChar:
+        TAY
+        LSR
+        LSR
+        LSR
+        LSR
+        ORA #$E0
+        BRA _twoInputBytesLeft ; hijack
+_oneOrTwoByteChar:
+        LDA r_SignalIn
+        BEQ _discardSignal2 ; TODO: cursor keys, other special keys?
+        BMI _smallTwoByteChar
+        BBS6 g_BIOSFlags,+
+        CMP #28 ; control-backslash
+        BEQ _controlBackslash
++       BBS7 g_BIOSFlags,+
+        CMP #20 ; control-T
+        BEQ _controlT
++       JSR free_pushKey ; US-ASCII, easy-peasy
+        BRA _discardSignal2
+_smallTwoByteChar:
+        TAY
+        ROL
+        ROL
+        ROL
+        AND #3
+        ORA #$C0
+        BRA _noInputByteLeft
+_fourByteChar:
+        CMP #$11
+        BCS _discardSignal3 ; Out of range
+        TAY
+        LSR
+        LSR
+        ORA #$F0
+        JSR free_pushKey ; lead byte
+        TYA
+        ASL
+        ASL
+        ASL
+        ASL
+        AND #$30
+        ORA #$80
+        STA g_Temp ; the high 4 bits of the first continuation byte
+        LDA r_SignalIn ; input byte 2 of 3
+        TAY
+        LSR
+        LSR
+        LSR
+        LSR
+        ORA g_Temp
+_twoInputBytesLeft:
+        JSR free_pushKey ; continuation byte 1
+        TYA
+        ASL
+        ASL
+        AND #$3C
+        ORA #$80
+_oneInputByteLeft:
+        STA g_Temp ; the high 6 bits of the next continuation byte
+        LDA r_SignalIn ; input byte 3 of 3
+        TAY
+        ROL
+        ROL
+        ROL
+        AND #$03
+        ORA g_Temp
+_noInputByteLeft:
+        JSR free_pushKey ; continuation byte 2
+        TYA
+        AND #$3F
+        ORA #$80
+        JSR free_pushKey ; continuation byte 3
+_discardSignal3: ; LOOOONG
+        JMP _discardSignal
+_controlT:
+        LDA #6
+        STA r_TerminalPort
+        LDA #12
+        JSR free_pushKey
+        BRA _discardSignal3
+_controlBackslash:
+        BNE +
+        TermOut 13, ">>> ^\ ", 13
+        PLY
+        PLX
+        PLA
+        ; Before we enter, record whether we will need to return to User mode
+        BBS6 r_MMUFlags,++
+        RMB1 g_Temp
+        JMP int_EnterMonitor
+++      SMB1 g_Temp
+        JMP int_EnterMonitor
+
+_skipUUID:
+        LDA r_SignalIn
+        CMP #$FF
+        BNE +
+        LDA r_SignalIn
+        CMP #$F8
+        BNE +
+        LDX #16
+-       LDA r_SignalIn
+        DEX
+        BNE -
+        RTS
++       PLA ; wasn't a UUID; ignore return address, discard signal
+        PLA
+        BRA _discardSignal3
+
+; Calculates a simple checksum on a string being given over the SignalIn port.
+; The checksum happens to be a perfect hash in the signal name space,
+; especially if combined with the name length. (This isn't surprising given how
+; few signal names there are with a given length.)
+_perfectHashSignalIn:
+        LDA #0
+-       CLC
+        ROL
+        ; if we shifted a bit out, this ADC will shift it back in
+        ADC r_SignalIn
+        DEX
+        BNE -
+        RTS
+
+int_BootError:
+        TermOut ">>> BOOT ERROR", 13
+        BRA int_EnterMonitorDueToFailedBoot
+
+int_RESET:
+        STZ g_BIOSFlags
+        STZ g_CurKeyInPos
+        STZ g_CurKeyOutPos
+        STZ r_TerminalPort
+        STZ g_EntryPoint
+        LDA #$10
+        STA g_EntryPoint+1
+        JSR boot_tryBoot
+        TermOut ">>> NO BOOT DEVICE", 13
+int_EnterMonitorDueToFailedBoot:
+        STZ g_Temp
+        LDX #$FF
+        TXS
+        ; PC high
+        LDA #>int_RESET
+        PHA
+        ; PC low
+        LDA #<int_RESET
+        PHA
+        ; P
+        LDA #$24
+        PHA
+        LDA #0
+        LDX #0
+        LDY #0
+int_EnterMonitor:
+        PHA
+        ; Store BIOS flags for later return
+        LDA g_BIOSFlags
+        PHA
+        ; disable most of the flags while we're in the monitor
+        AND #$13
+        ; but enable the "no echo" and "no ^\" flag
+        ORA #$60
+        STA g_BIOSFlags
+        ; whoever brought us here recorded whether we will need to return to
+        ; User mode in bit 1 of g_Temp
+        ; (or it was reset and it's a throw o' the dice! :D)
+        BBS1 g_Temp,+
+        LDA #0
+        PHA
+        BRA ++
++       LDA #$40
+        PHA
+++      TermOut 13, "?=help", 13
+        JMP _cmdHere
+_cmdloop:
+        TermOut 7, 13, "Cmd> "
+        JSR getb
+        CMP #0
+        BMI _hicmd
+        CMP #'a'
+        BCC +
+        CMP #'z'+1
+        BCS +
+        AND #$DF ; lowercase to uppercase
++       JSR echo
+        STA g_Temp
+        LDA #13
+        STA r_TerminalPort
+        PHX
+        LDX #0
+-       LDA.W _cmdtable,X
+        BEQ ++ ; end of table
+        CMP g_Temp
+        BNE +
+        LDA.W _cmdtable+1,X
+        STA g_PokeAddr
+        LDA.W _cmdtable+2,X
+        STA g_PokeAddr+1
+        PLX
+        JMP (g_PokeAddr)
++       INX
+        INX
+        INX
+        BRA -
+++      PLX
+_invalidcmd:
+        LDA #'?'
+        STA r_TerminalPort
+        STA r_TerminalPort
+        STA r_TerminalPort
+        LDA #13
+        STA r_TerminalPort
+        BRA _cmdloop
+_hicmd: ; ignore Unicode chars
+        BRA _cmdloop
+
+free_pushKey:
+        PHX
+        BBS5 g_BIOSFlags,+
+        JSR echo
++       LDX g_CurKeyInPos
+        ; in the event of overflow, ...stick our head in the sand
+        STA g_KeyboardBuffer,X
+        INX
+        CPX #k_KeyboardBufferLength
+        BNE +
+        LDX #0
++       STX g_CurKeyInPos
+        PLX
+        RTS
+
+_hexdigits:
+.DB "0123456789ABCDEF"
+free_hexOut:
+        PHA
+        PHX
+        PHA
+        LSR
+        LSR
+        LSR
+        LSR
+        TAX
+        LDA.W _hexdigits,X
+        STA r_TerminalPort
+        PLA
+        AND #15
+        TAX
+        LDA.W _hexdigits,X
+        STA r_TerminalPort
+        PLX
+        PLA
+        RTS
+
+; Stack during monitor routines (top down):
+;   User mode flag byte
+;   BIOS flag backup
+;   Accumulator
+;   Return P
+;   Return PC, low
+;   Return PC, high
+; A has no special meaning and can be clobbered freely, but X and Y should be
+; preserved.
+
+;_cmdHelp:
+;        TermOut 13, "? = this help; . = show current CPU state", 13, "< = poke to memory; > = peek from memory"
+;        TermOut 13, "A/X/Y/P = poke A/X/Y/P; R = return from monitor"
+;        TermOut 13, "E = jump to entry point; J = jump to address", 13, "B = manual program load; S = shut down"
+;        TermOut 13, "L = list attached components", 13
+;        JMP _cmdloop
+_cmdHelp:
+        TermOut 13, "?=help .=state <=poke >=peek A/X/Y/P=regpoke", 13, "R=return E=enter J=jump B=handboot L=listdevs"
+        JMP _cmdloop
+
+_cmdHere:
+        PHX
+        TSX
+        PHY
+        ; We can't use $010x,X style accesses because the stack is modular, and
+        ; we don't want to read random registers because of a wrapped stack
+        INX ; (the X we just pushed)
+        INX ; (user mode flag byte)
+        INX ; (BIOS flag backup)
+        INX ; (accumulator)
+        INX ; (return P)
+        INX ; (return PC low)
+        INX ; (we're here... return PC high)
+        TermOutC3 'P','C',':'
+        LDA $0100,X
+        JSR free_hexOut
+        DEX ; (return PC low)
+        LDA $0100,X
+        JSR free_hexOut
+        DEX ; (return P)
+        DEX ; (accumulator)
+        DEX ; (BIOS flag backup)
+        DEX ; (user mode flag byte)
+        LDA $0100,X
+        BEQ +
+        TermOutC3 '(','U',')'
+        BRA +
++       INX ; (BIOS flag backup)
+        INX ; (accumulator)
+        INX ; (return P)
+        TermOutC3 ' ','P',':'
+        LDA $0100,X
+        JSR free_hexOut
+        LDY #'='
+        STY r_TerminalPort
+        JSR free_pOut
+        DEX ; (accumulator)
+        TermOutC3 ' ','A',':'
+        LDA $0100,X
+        JSR free_hexOut
+        DEX ; (BIOS flag backup)
+        DEX ; (user mode flag byte)
+        DEX ; (X)
+        TermOutC3 ' ','X',':'
+        LDA $0100,X
+        JSR free_hexOut
+        TermOutC3 ' ','Y',':'
+        PLY
+        TYA
+        JSR free_hexOut
+        TermOutC3 ' ','S',':'
+        TXA
+        CLC
+        ADC #6
+        JSR free_hexOut
+        LDA #13
+        STA r_TerminalPort
+        PLX
+        JMP _cmdloop
+
+; well, this is ugly unrolled
+free_pOut:
+        PHA
+        PHX
+        TAX
+        ; N bit
+        BIT #$80
+        BNE +
+        LDA #'n'
+        BRA ++
++       LDA #'N'
+++      STA r_TerminalPort
+        TXA
+        ; V bit
+        BIT #$40
+        BNE +
+        LDA #'v'
+        BRA ++
++       LDA #'V'
+++      STA r_TerminalPort
+        TXA
+        ; "flag" bit
+        BIT #$20
+        BNE +
+        LDA #'0'
+        BRA ++
++       LDA #'1'
+++      STA r_TerminalPort
+        TXA
+        ; B bit
+        BIT #$10
+        BNE +
+        LDA #'b'
+        BRA ++
++       LDA #'B'
+++      STA r_TerminalPort
+        TXA
+        ; D bit
+        BIT #$08
+        BNE +
+        LDA #'d'
+        BRA ++
++       LDA #'D'
+++      STA r_TerminalPort
+        TXA
+        ; I bit
+        BIT #$04
+        BNE +
+        LDA #'i'
+        BRA ++
++       LDA #'I'
+++      STA r_TerminalPort
+        TXA
+        ; Z bit
+        BIT #$02
+        BNE +
+        LDA #'z'
+        BRA ++
++       LDA #'Z'
+++      STA r_TerminalPort
+        TXA
+        ; C bit
+        BIT #$01
+        BNE +
+        LDA #'c'
+        BRA ++
++       LDA #'C'
+++      STA r_TerminalPort
+        PLX
+        PLA
+        RTS
+
+_cmdPoke:
+        TermOut "Poke mem.", 13
+        JSR free_getPokeAddr
+        JSR free_getValue
+        STA (g_PokeAddr)
+        TermOut "Poked", 13
+        JMP _cmdloop
+
+_cmdPokeA:
+        TermOut "Poke A.", 13
+        JSR free_getValue
+        PHX
+        TSX
+        INX
+        INX
+        INX
+        INX
+        STA $0100,X
+        PLX
+        JMP _cmdloop
+
+_cmdPokeX:
+        TermOut "Poke X.", 13
+        JSR free_getValue
+        TAX
+        JMP _cmdloop
+
+_cmdPokeY:
+        TermOut "Poke Y.", 13
+        JSR free_getValue
+        TAY
+        JMP _cmdloop
+
+_cmdPokeP:
+        TermOut "Poke P.", 13
+        JSR free_getValue
+        PHX
+        TSX
+        INX
+        INX
+        INX
+        INX
+        INX
+        STA $0100,X
+        PLX
+        JMP _cmdloop
+
+_cmdReturnFromMonitor:
+        ; save user mode return flag
+        PLA
+        STA g_Temp
+        ; BIOS flags
+        PLA
+        STA g_BIOSFlags
+        ; Accumulator
+        PLA
+        ; Enter user mode if user mode return flag is set
+        BBR1 g_Temp,+
+        SMB1 r_MMUFlags
++       RTI
+
+_cmdJumpToEntry:
+        TermOut "Jump to "
+        LDA g_EntryPoint+1
+        JSR free_hexOut
+        LDA g_EntryPoint
+        JSR free_hexOut
+        LDA #13
+        STA r_TerminalPort
+        JMP (g_EntryPoint)
+
+_cmdJumpToAddress:
+        TermOut "Jump.", 13
+        JSR free_getPokeAddr
+        JMP (g_PokeAddr)
+
+_cmdPeek:
+        TermOut "Peek mem.", 13
+        JSR free_getPokeAddr
+        TermOut "Value: "
+        LDA (g_PokeAddr)
+        JSR free_hexOut
+        LDA #13
+        STA r_TerminalPort
+        JMP _cmdloop
+
+_cmdManualLoad:
+;       TermOut "Beginning manual load. Please paste and/or type", 13, "Motorola S-records. When finished, type a period.", 13
+;       TermOut "Please do not disconnect any components during", 13, "this process.", 13
+        TermOut "Manual program load. Paste or type S-records.", 13, "Type . when finished.", 13
+        SEI
+        LDA #<_bootgetb_user
+        STA g_boot_getb
+        LDA #>_bootgetb_user
+        STA g_boot_getb+1
+        LDA #1
+        STA g_boot_ok
+        STZ g_userboot_remPasteBytes
+        STZ g_userboot_remPasteBytes+1
+        JSR boot_loadText
+        ; clobbered during the process
+        STZ g_CurKeyInPos
+        STZ g_CurKeyOutPos
+        ; interrupts will be restored when we call `getb`
+        JMP _cmdloop
+
+_cmdShutDown
+.DB $DB ; STP
+
+_cmdList:
+        LDA #$FF
+        STA r_ComponentList
+--      LDX #0
+-       CLV
+        LDA r_ComponentList
+        BVS ++
+        BEQ +
+        STA r_TerminalPort
+        INX
+        BRA -
++       LDA #' '
+-       CPX #16
+        BCS +
+        INX
+        STA r_TerminalPort
+        BRA -
++       LDX #16
+-       LDA r_ComponentList
+        JSR free_hexOut
+        DEX
+        BNE -
+        STZ r_ComponentList
+        LDA #13
+        STA r_TerminalPort
+        BRA --
+++      JMP _cmdloop
+
+_cmdClear:
+        LDA #4
+        STA r_TerminalPort
+        JMP _cmdloop
+
+free_getByte:
+        JSR free_getHexDigit
+        ASL
+        ASL
+        ASL
+        ASL
+        STA g_Temp
+        JSR free_getHexDigit
+        ORA g_Temp
+        RTS
+
+free_getValue:
+        TermOut "Value>    <", 8, 8, 8, 8
+        JSR free_getByte
+        PHA
+        LDA #13
+        STA r_TerminalPort
+        PLA
+        RTS
+
+free_getPokeAddr
+        TermOut "Addr>      <", 8, 8, 8, 8, 8, 8
+        JSR free_getByte
+        STA g_PokeAddr+1
+        JSR free_getByte
+        STA g_PokeAddr
+        LDA #13
+        STA r_TerminalPort
+        RTS
+
+free_getHexDigit:
+        JSR getb
+        ; Decimal digit
+        CMP #'0'
+        BCC free_getHexDigit
+        CMP #'9'+1
+        BCS +
+        STA r_TerminalPort
+        SEC
+        SBC #'0'
+        RTS
+        ; Hex digit
++       CMP #'a'
+        BCC +
+        AND #$DF ; lowercase to uppercase
++       CMP #'A'
+        BCC free_getHexDigit
+        CMP #'F'+1
+        BCS free_getHexDigit
+        STA r_TerminalPort
+        SEC
+        SBC #'A'-10
+        RTS
+
+boot_getCheckedByte:
+        JSR boot_getByte
+        PHA
+        CLC
+        ADC g_textboot_checksum
+        STA g_textboot_checksum
+        PLA
+        RTS
+
+boot_getByte:
+        JSR boot_getHexDigit
+        ASL
+        ASL
+        ASL
+        ASL
+        STA g_Temp
+        JSR boot_getHexDigit
+        ORA g_Temp
+        RTS
+
+; gets a little funky if input is corrupted
+boot_getHexDigit:
+        JSR boot_getb
+        ; Decimal digit
+        CMP #'0'
+        BCC boot_getHexDigit
+        CMP #'9'+1
+        BCS +
+        SEC
+        SBC #'0'
+        RTS
+        ; Hex digit
++       CMP #'a'
+        BCC +
+        AND #$DF ; lowercase to uppercase
++       CMP #'A'
+        BCC boot_getHexDigit
+        CMP #'F'+1
+        BCS boot_getHexDigit
+        SEC
+        SBC #'A'-10
+        RTS
+
+boot_getb:
+        JMP (g_boot_getb)
+
+boot_loadText:
+-       CLV
+        JSR boot_getb
+        ; finish if getc sets the overflow flag
+        BVC +
+        RTS
++       CMP #'S'
+        BEQ boot_readSRec
+        BRA - ; skip until we find one we like
+boot_readSRec:
+        JSR boot_getb
+        CMP #'1' ; 16-bit data record
+        BEQ boot_S1
+        CMP #'9' ; 16-bit entry point record
+        BEQ +
+        CMP #'5' ; 16-bit count record (ignored)
+        BEQ +
+        TermOut "Invalid S-record", 13
+        STZ g_boot_ok
++       BRA boot_loadText
++       JMP boot_S9
+boot_S1:
+        STZ g_textboot_checksum
+        ; byte count
+        JSR boot_getCheckedByte
+        CMP #3
+        BCS +
+        TermOut "S1 record too short", 13
+        STZ g_boot_ok
++       TAX
+        ; address, high
+        JSR boot_getCheckedByte
+        STA g_boot_cursor+1
+        ; address, low
+        JSR boot_getCheckedByte
+        STA g_boot_cursor
+        ; data bytes!
+        DEX
+        DEX
+-       DEX
+        BEQ +
+        JSR boot_getCheckedByte
+        JSR boot_poke
+        BRA -
++       JSR boot_getByte
+        EOR #$FF
+        CMP g_textboot_checksum
+        BEQ +
+        TermOut "Checksum mismatch", 13
+        STZ g_boot_ok
++       JMP boot_loadText
+boot_S9:
+        STZ g_textboot_checksum
+        ; byte count
+        JSR boot_getCheckedByte
+        CMP #3
+        BEQ +
+        TermOut "S9 record wrong length", 13
+        STZ g_boot_ok
+        JMP boot_loadText
++       ; address, high
+        JSR boot_getCheckedByte
+        STA g_boot_cursor+1
+        ; address, low
+        JSR boot_getCheckedByte
+        STA g_boot_cursor
+        JSR boot_getByte
+        EOR #$FF
+        CMP g_textboot_checksum
+        BEQ +
+        TermOut "Checksum mismatch", 13
+        STZ g_boot_ok
+        BRA ++
++       LDA g_boot_cursor
+        STA g_EntryPoint
+        LDA g_boot_cursor+1
+        STA g_EntryPoint+1
+++      JMP boot_loadText
+
+boot_poke:
+        PHA
+        LDA g_boot_cursor+1
+        CMP #$10
+        BCS boot_poke_check_high
+        CMP #$00
+        BNE boot_poke_invalid_addr
+        ; poking a zero page address
+        LDA g_boot_cursor
+        CMP #$40
+        BCC boot_poke_invalid_addr
+        ; we're okay
+boot_poke_ok:
+        PLA
+        STA (g_boot_cursor)
+        INC g_boot_cursor
+        BNE +
+        INC g_boot_cursor+1
++       RTS
+boot_poke_check_high:
+        LDA r_MemBanksHigh
+        BNE boot_poke_ok ; at least 256 valid banks
+        LDA r_MemBanksLow
+        CMP #$F
+        BCS boot_poke_ok ; at least 15 banks
+        ASL
+        ASL
+        ASL
+        ASL
+        ORA #15
+        CMP g_boot_cursor+1
+        BCS boot_poke_ok ; enough banks
+boot_poke_invalid_addr:
+        LDA g_boot_ok
+        BEQ + ; if boot is already not OK, don't spam
+        TermOut "Loading program to invalid address", 13
+        STZ g_boot_ok
+        PLA
+        RTS
+
+boot_loadBinary:
+        STZ g_boot_cursor
+        LDA #$10
+        STA g_boot_cursor+1
+-       CLV
+        JSR boot_getb
+        ; finish if getc sets the overflow flag
+        BVC +
+        RTS
++       JSR boot_poke
+        BRA -
+
+_bootgetb_user_remPaste:
+        ; multi-byte DEC
+        LDA g_userboot_remPasteBytes
+        BNE +
+        DEC g_userboot_remPasteBytes+1
++       DEC g_userboot_remPasteBytes
+        LDA r_SignalIn
+        BMI _bootgetb_user_paste
+        CLV
+        RTS
+_bootgetb_user_paste:
+        LDA g_userboot_remPasteBytes
+        BNE _bootgetb_user_remPaste
+        LDA g_userboot_remPasteBytes+1
+        BNE _bootgetb_user_remPaste
+        ; paste is over
+        STZ r_SignalIn
+        LDA #<_bootgetb_user
+        STA g_boot_getb
+        LDA #>_bootgetb_user
+        STA g_boot_getb+1
+        ; and fall through
+_bootgetb_user:
+        BRA +
+-       .DB $CB ; WAI
++       CLV
+        LDA r_SignalIn
+        BVS -
+        BNE - ; not a string... not a short one, anyway
+        LDA r_SignalIn
+        PHX
+        PHY
+        TAY ; save the length of the signal name in Y
+        TAX
+        JSR _perfectHashSignalIn
+        CMP #29 ; key_down?
+        BEQ _bootgetb_maybeKeyDown
+        CMP #197 ; clipboard?
+        BEQ _bootgetb_maybeClipboard
+_bootgetb_discardSignal:
+        PLY
+        PLX
+        STZ r_SignalIn ; discard signal
+        BRA -
+
+_bootgetb_maybeClipboard:
+        CPY #9 ; `clipboard` is 9 chars long
+        BNE _bootgetb_discardSignal
+        ; Skip the UUID of the keyboard
+        JSR _bootgetb_skipUUID
+        LDA r_SignalIn
+        BMI _bootgetb_discardSignal ; not a string or byte array
+        AND #$3F ; don't care whether it's a string or byte array :)
+        STA g_userboot_remPasteBytes+1
+        LDA r_SignalIn
+        STA g_userboot_remPasteBytes
+        LDA #<_bootgetb_user_paste
+        STA g_boot_getb
+        LDA #>_bootgetb_user_paste
+        STA g_boot_getb+1
+        PLY
+        PLX
+        TermOut "(paste received)", 13
+        JMP _bootgetb_user_paste
+_bootgetb_maybeKeyDown:
+        CPY #8 ; `key_down` is 8 chars long
+        BNE _bootgetb_discardSignal
+        ; Skip the UUID of the keyboard
+        JSR _bootgetb_skipUUID
+        ; Integer: the character code
+        LDA r_SignalIn
+        CMP #$FF
+        BNE _bootgetb_discardSignal ; definitely not an integer
+        LDA r_SignalIn
+        CMP #$FB
+        BNE _bootgetb_discardSignal ; not an integer
+        ; skip any non-ASCII character
+        LDA r_SignalIn
+        BNE _bootgetb_discardSignal
+        LDA r_SignalIn
+        BNE _bootgetb_discardSignal
+        LDA r_SignalIn
+        BNE _bootgetb_discardSignal
+        LDA r_SignalIn
+        BEQ _bootgetb_discardSignal
+        BMI _bootgetb_discardSignal
+        JSR echo
+        CMP #'.'
+        BNE +
+        ; during user-driven load, . means it's over
+        LDA #<_bootgetb_eof
+        STA g_boot_getb
+        LDA #>_bootgetb_eof
+        STA g_boot_getb+1
+        ; set overflow flag
+        CLC
+        LDA #$7F
+        ADC #$7F
++       PLY
+        PLX
+        STZ r_SignalIn ; discard rest of signal, and return
+        RTS
+
+_bootgetb_eof:
+        ; set overflow flag
+        CLC
+        LDA #$7F
+        ADC #$7F
+        RTS
+
+_bootgetb_skipUUID:
+        LDA r_SignalIn
+        CMP #$FF
+        BNE +
+        LDA r_SignalIn
+        CMP #$F8
+        BNE +
+        LDX #16
+-       LDA r_SignalIn
+        DEX
+        BNE -
+        RTS
++       PLA ; wasn't a UUID; ignore return address, discard signal
+        PLA
+        JMP _bootgetb_discardSignal
+
+boot_tryBoot:
+        LDA #$FF
+        STA r_ComponentList
+--      STZ g_Temp
+        LDX #0
+-       CLV
+        LDA r_ComponentList
+        BVS +++
+        BEQ +
+        CLC
+        ROL g_Temp
+        ADC g_Temp
+        STA g_Temp
+        INX
+        BRA -
++       LDA g_Temp
+        CMP #45 ; filesystem
+        BNE +
+        CPX #10
+        BNE +
+        ; found a filesystem!
+        JSR boot_setBootDeviceFromList
+        JSR boot_tryThisFilesystem
+        ; if it returns, no boot attempt was made. fall through.
+-
+++      STZ r_ComponentList
+        BRA --
++       CMP #199 ; drive
+        BNE -
+        CPX #5
+        BNE -
+        JSR boot_setBootDeviceFromList
+        JSR boot_tryThisDrive
+        BRA -
++++     RTS ; no more components
+
+boot_setBootDeviceFromList:
+        LDX #0
+-       LDA r_ComponentList
+        STA g_BootUUID,X
+        INX
+        CPX #16
+        BNE -
+        RTS
+
+boot_targetBootDev:
+        LDA r_ComponentPort ; abort any previous component call in progress
+        CLV
+        ; UIFTAG_UUID
+        LDA #$FF
+        STA r_ComponentPort
+        LDA #$F8
+        STA r_ComponentPort
+        LDX #0
+-       LDA g_BootUUID,X
+        STA r_ComponentPort
+        INX
+        CPX #16
+        BNE -
+        RTS
+
+boot_outputString:
+        STZ r_ComponentPort ; only short strings :)
+        STX r_ComponentPort
+        LDY #0
+-       LDA (g_PokeAddr),Y
+        STA r_ComponentPort
+        INY
+        DEX
+        BNE -
+        RTS
+
+; clobbers A,X,Y
+.MACRO boot_outputString
+        LDA #<\1
+        STA g_PokeAddr
+        LDA #>\1
+        STA g_PokeAddr+1
+        LDX #\2
+        JSR boot_outputString
+.ENDM
+boot_outputTargetPath:
+        LDA g_fsboot_targetfile
+        STA g_PokeAddr
+        LDA g_fsboot_targetfile+1
+        STA g_PokeAddr+1
+        LDX g_fsboot_targetfilelen
+        JMP boot_outputString ; tail return
+.MACRO boot_outputTargetPath
+       JSR boot_outputTargetPath
+.ENDM
+boot_outputEnd:
+        LDA #$FF
+        STA r_ComponentPort
+        STA r_ComponentPort
+        RTS
+.MACRO boot_outputEnd
+       JSR boot_outputEnd
+.ENDM
+boot_outputTargetHandle:
+       LDA #$80
+       STA r_ComponentPort
+       LDA g_fsboot_filehandle
+       STA r_ComponentPort
+       RTS
+.MACRO boot_outputTargetHandle
+       JSR boot_outputTargetHandle
+.ENDM
+boot_outputPageSize:
+       LDA #$FF
+       STA r_ComponentPort
+       LDA #$FB
+       STA r_ComponentPort
+       STZ r_ComponentPort
+       STZ r_ComponentPort
+       LDA #1
+       STA r_ComponentPort
+       STZ r_ComponentPort
+       RTS
+.MACRO boot_outputPageSize
+       JSR boot_outputPageSize
+.ENDM
+boot_outputTinyInt:
+       LDX #$FF
+       STX r_ComponentPort
+       LDX #$FB
+       STX r_ComponentPort
+       STZ r_ComponentPort
+       STZ r_ComponentPort
+       STZ r_ComponentPort
+       STA r_ComponentPort
+       RTS
+.MACRO boot_outputOne
+       LDA #1
+       JSR boot_outputTinyInt
+.ENDM
+.MACRO boot_outputZero
+       LDA #0
+       JSR boot_outputTinyInt
+.ENDM
+
+boot_tryThisFilesystem:
+        LDA #<_bootfile1
+        STA g_fsboot_targetfile
+        LDA #>_bootfile1
+        STA g_fsboot_targetfile+1
+        LDA #_bootfile1len
+        STA g_fsboot_targetfilelen
+        JSR boot_tryThisFile
+        LDA #<_bootfile2
+        STA g_fsboot_targetfile
+        LDA #>_bootfile2
+        STA g_fsboot_targetfile+1
+        LDA #_bootfile2len
+        STA g_fsboot_targetfilelen
+        JSR boot_tryThisFile
+-       RTS ; no apparently bootable file found
+; save one byte by using the RTS from the previous routine when we need to
+; branch-to-RTS (we're running low on bytes, sure am regretting that TermOut
+; macro now!)
+boot_tryThisFile:
+        JSR boot_targetBootDev
+        boot_outputString _exists, _existslen
+        boot_outputTargetPath
+        boot_outputEnd
+        ; OK? Return 0, `UIFTAG_TRUE`
+        LDA r_ComponentPort
+        BNE -
+        LDA r_ComponentPort
+        CMP #$FF
+        BNE -
+        LDA r_ComponentPort
+        CMP #$F7
+        BNE -
+        ; the file exists!
+        JSR boot_targetBootDev
+        boot_outputString _open, _openlen
+        boot_outputTargetPath
+        boot_outputEnd
+        ; OK? Return 0, a value handle
+        LDA r_ComponentPort
+        BEQ +
+        JMP int_BootError
+-
++       LDA r_ComponentPort
+        CMP #$80
+        BNE -
+        LDA r_ComponentPort
+        STA g_fsboot_filehandle
+        ; Read first byte of file.
+        JSR boot_targetBootDev
+        boot_outputString _read, _readlen
+        boot_outputTargetHandle
+        boot_outputOne
+        boot_outputEnd
+        ; OK? Return 0, `UIFTAG_BYTE_ARRAY(1)`
+        LDA r_ComponentPort
+        BNE +
+        LDA r_ComponentPort
+        CMP #$40
+        BNE +
+        LDA r_ComponentPort
+        CMP #$01
+        BNE +
+        LDA r_ComponentPort
+        ; save it
+        PHA
+        ; before we do anything with this, seek back to 0
+        JSR boot_targetBootDev
+        boot_outputString _seek, _seeklen
+        boot_outputTargetHandle
+        boot_outputString _set, _setlen
+        boot_outputZero
+        boot_outputEnd
+        ; Success? (We assume success if the call doesn't completely fail)
+        LDA r_ComponentPort
+        BNE +
+        LDA #<_bootgetb_filesystem
+        STA g_boot_getb
+        LDA #>_bootgetb_filesystem
+        STA g_boot_getb+1
+        STZ g_fsboot_remReadBytes
+        STZ g_fsboot_remReadBytes+1
+        LDA #1
+        STA g_boot_ok
+        ; Okay, so about that byte we read...
+        PLA
+        CMP #'S'
+        BEQ boot_filesystem_textImage
+        BRA boot_filesystem_binaryImage
++       LDA g_fsboot_filehandle
+        STA r_DisposeValue
+--
+++      JMP int_BootError
+
+boot_filesystem_binaryImage:
+        JSR boot_loadBinary
+        BRA +
+boot_filesystem_textImage:
+        JSR boot_loadText
++       LDA g_fsboot_filehandle
+        STA r_DisposeValue
+boot_trailer:
+        STZ g_CurKeyInPos
+        STZ g_CurKeyOutPos
+        LDA g_boot_ok
+        BEQ --
+        LDX #$FF
+        TXS
+        LDA #0
+        LDX #0
+        LDY #0
+        JMP (g_EntryPoint)
+
+; we assume sectors are at least 256 bytes long, and all drives have at least
+; two sectors
+boot_tryThisDrive:
+        LDA g_BootUUID
+        STA r_DriveAddr
+        LDA g_BootUUID+1
+        STA r_DriveAddr+1
+        LDA r_DriveSectorPages
+        BNE +
+--      RTS
++       LDA #1
+        ; Does the first sector start with CAB"?
+        STA r_DriveSector
+        STZ r_DriveSector+1
+        LDA r_DrivePort
+        CMP #'C'
+        BNE +
+        LDA r_DrivePort
+        CMP #'A'
+        BNE +
+        ; tricksy...
+        INA ; A := 'B'
+        CMP r_DrivePort
+        BEQ boot_bootThisDrive
++       ; What about the second sector?
+        INC r_DriveSector
+        LDA r_DrivePort
+        LDA r_DrivePort
+        CMP #'C'
+        BNE --
+        LDA r_DrivePort
+        CMP #'A'
+        BNE --
+        INA ; A := 'B'
+        CMP r_DrivePort
+        BNE --
+        ; fall through
+boot_bootThisDrive:
+        ; Scan to excalamation point
+        CLV
+-       LDA r_DrivePort
+        BVS --
+        CMP #'!'
+        BNE -
+        ; Magic sequence present?
+        LDA r_DrivePort
+        BNE --
+        LDA r_DrivePort
+        CMP #$1A
+        BNE --
+        LDA r_DrivePort
+        CMP #$CA
+        BNE --
+        LDA r_DrivePort
+        CMP #$BD
+        BNE --
+        ; start looking at records
+---     LDA r_DrivePort
+        BEQ -- ; no more records
+        LDA r_DrivePort
+        STA g_driveboot_flags
+        LDA r_DrivePort
+        STA g_driveboot_load_start
+        LDA r_DrivePort
+        STA g_driveboot_load_start+1
+        LDA r_DrivePort
+        STA g_driveboot_load_length
+        LDA r_DrivePort
+        STA g_driveboot_load_length+1
+        LDA r_DrivePort
+        STA g_driveboot_load_length+2
+        LDA r_DrivePort
+        STA g_driveboot_load_length+3
+        ; read AID
+        STZ g_Temp
+        LDX #0
+-       LDA r_DrivePort
+        BVC +
+        RTS
++       BEQ +
+        CLC
+        ROL g_Temp
+        ADC g_Temp
+        STA g_Temp
+        INX
+        BRA -
++       LDA g_Temp
+        CMP #49 ; OCMOS?
+        BNE ---
+        CPX #5
+        BNE ---
+        LDA #$3F
+        BIT g_driveboot_flags
+        BVS +
+        TermOut "load_start is byte offset", 13
+-       JMP int_BootError
++       BMI +
+        ; big-endian record, let's swap
+        LDA g_driveboot_load_length
+        LDX g_driveboot_load_length+3
+        STX g_driveboot_load_length
+        STA g_driveboot_load_length+3
+        LDA g_driveboot_load_length+1
+        LDX g_driveboot_load_length+2
+        STX g_driveboot_load_length+1
+        STA g_driveboot_load_length+2
+        LDA g_driveboot_load_start
+        LDX g_driveboot_load_start+1
+        STX g_driveboot_load_start
+        STA g_driveboot_load_start+1
++       ; let's start loading
+        LDA g_driveboot_load_start
+        STA r_DriveSector
+        LDA g_driveboot_load_start+1
+        STA r_DriveSector+1
+        LDA #<_bootgetb_temp_then_drive
+        STA g_boot_getb
+        LDA #>_bootgetb_temp_then_drive
+        STA g_boot_getb+1
+        LDA #1
+        STA g_boot_ok
+        LDA r_DrivePort
+        STA g_Temp
+        CMP #'S'
+        BEQ boot_drive_textImage
+boot_drive_binaryImage:
+        JSR boot_loadBinary
+        BRA +
+boot_drive_textImage:
+        JSR boot_loadText
++       JMP boot_trailer
+
+_bootgetb_temp_then_drive:
+        LDA #<_bootgetb_drive
+        STA g_boot_getb
+        LDA #>_bootgetb_drive
+        STA g_boot_getb+1
+        LDA g_Temp
+        RTS
+
+_bootgetb_drive:
+        LDA g_driveboot_load_length
+        BNE +
+        LDA g_driveboot_load_length+1
+        BNE +
+        LDA g_driveboot_load_length+2
+        BNE +
+        LDA g_driveboot_load_length+3
+        BNE +
+        ; no bytes left, let's give EOF
+        LDA #$7F
+        ADC #$7F
+        RTS
++       CLV
+        LDA g_driveboot_load_length+3
+        LDA g_driveboot_load_length+2
+        LDA g_driveboot_load_length+1
+        LDA g_driveboot_load_length
+        ; BIIIIIIIIG DEC
+        LDA g_driveboot_load_length
+        BNE +++
+        LDA g_driveboot_load_length+1
+        BNE ++
+        LDA g_driveboot_load_length+2
+        BNE +
+        DEC g_driveboot_load_length+3
++       DEC g_driveboot_load_length+2
+++      DEC g_driveboot_load_length+1
++++     DEC g_driveboot_load_length
+        LDA r_DrivePort
+        BVC ++
+        CLV
+        INC r_DriveSector
+        BNE +
+        INC r_DriveSector+1
++       LDA r_DrivePort
+        BVC ++
+        TermOut "ran into end of drive", 13
+        STZ g_boot_ok
+        ; overflow is already set for us
+++      RTS
+
+_bootgetb_filesystem:
+        LDA g_fsboot_remReadBytes
+        BNE +
+        LDA g_fsboot_remReadBytes
+        BNE +
+        ; no bytes left, time to read
+        JSR boot_targetBootDev
+        boot_outputString _read, _readlen
+        boot_outputTargetHandle
+        boot_outputPageSize
+        boot_outputEnd
+        ; success? 0, `UIFTAG_BYTE_ARRAY(...)
+        LDA r_ComponentPort
+        BNE +++
+        LDA r_ComponentPort
+        BMI ++ ; not a byte array... hope it's null
+        AND #$3F ; probably not a string, and if it is, we actually don't care
+        STA g_fsboot_remReadBytes
+        LDA r_ComponentPort
+        STA g_fsboot_remReadBytes
++       ; Big DEC
+        LDA g_fsboot_remReadBytes
+        BNE +
+        DEC g_fsboot_remReadBytes+1
++       DEC g_fsboot_remReadBytes
+        ; Read the next byte
+        LDA r_ComponentPort
+        CLV
+        RTS
+++      ; Is it NULL?
+        CMP #$FF
+        BNE +++
+        LDA r_ComponentPort
+        CMP #$FE
+        ; if yes, then we've hit the end of the file
+        BEQ +
++++     STZ g_boot_ok
++       JMP _bootgetb_eof
+
+_exists: .DB "exists"
+.DEFINE _existslen 6
+_open: .DB "open"
+.DEFINE _openlen 4
+_read: .DB "read"
+.DEFINE _readlen 4
+_seek: .DB "seek"
+.DEFINE _seeklen 4
+_set: .DB "set"
+.DEFINE _setlen 3
+_bootfile1: .DB "OCMOS/boot"
+.DEFINE _bootfile1len 10
+_bootfile2: .DB "OCMOS"
+.DEFINE _bootfile2len 5
+
+_cmdtable:
+.DB '?'
+.DW _cmdHelp
+.DB '.'
+.DW _cmdHere
+.DB '<'
+.DW _cmdPoke
+.DB '>'
+.DW _cmdPeek
+.DB 'A'
+.DW _cmdPokeA
+.DB 'X'
+.DW _cmdPokeX
+.DB 'Y'
+.DW _cmdPokeY
+.DB 'P'
+.DW _cmdPokeP
+.DB 'R'
+.DW _cmdReturnFromMonitor
+.DB 'E'
+.DW _cmdJumpToEntry
+.DB 'J'
+.DW _cmdJumpToAddress
+.DB 'B'
+.DW _cmdManualLoad
+.DB 'S'
+.DW _cmdShutDown
+.DB 'L'
+.DW _cmdList
+.DB 12
+.DW _cmdClear
+.DB 0
+
+.ENDS
